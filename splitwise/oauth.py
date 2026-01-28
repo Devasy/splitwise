@@ -8,7 +8,7 @@ import hashlib
 import base64
 import time
 import secrets
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlencode, quote, parse_qs
 
 import aiohttp
@@ -62,7 +62,7 @@ class AsyncOAuth1:
         self,
         method: str,
         url: str,
-        params: Dict[str, str]
+        params: Dict[str, Any]
     ) -> str:
         """Generate the signature base string.
         
@@ -74,12 +74,20 @@ class AsyncOAuth1:
         Returns:
             Signature base string
         """
-        # Sort parameters alphabetically
-        sorted_params = sorted(params.items())
-        param_string = '&'.join(
-            f"{self._percent_encode(k)}={self._percent_encode(v)}"
-            for k, v in sorted_params
-        )
+        # RFC 5849 §3.4.1.3.2: encode first, then sort encoded key/value pairs
+        flattened: List[Tuple[str, str]] = []
+        for k, v in params.items():
+            values = v if isinstance(v, (list, tuple)) else [v]
+            for value in values:
+                flattened.append(
+                    (
+                        self._percent_encode(str(k)),
+                        self._percent_encode(str(value))
+                    )
+                )
+
+        encoded_pairs = sorted(flattened, key=lambda item: (item[0], item[1]))
+        param_string = '&'.join(f"{k}={v}" for k, v in encoded_pairs)
         
         # Build base string
         base_string = '&'.join([
@@ -94,7 +102,7 @@ class AsyncOAuth1:
         self,
         method: str,
         url: str,
-        params: Dict[str, str]
+        params: Dict[str, Any]
     ) -> str:
         """Generate HMAC-SHA1 signature.
         
