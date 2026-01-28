@@ -2,12 +2,13 @@
 
 This module provides efficient aiohttp session management with:
 - Connection pooling for low-compute/edge devices
-- Automatic retry with exponential backoff
+- Automatic retry with exponential backoff for transient errors
 - Timeout configurations
 - Memory-efficient resource handling
 """
 
 import asyncio
+import logging
 import aiohttp
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -24,6 +25,55 @@ from splitwise.exception import (
     SplitwiseNotAllowedException,
     SplitwiseNotFoundException
 )
+
+logger = logging.getLogger(__name__)
+
+
+class ResponseAdapter:
+    """Adapter to make aiohttp responses compatible with requests-style exceptions.
+    
+    The Splitwise exception classes expect a requests.Response-like object.
+    This adapter wraps aiohttp.ClientResponse to provide compatible attributes.
+    """
+    
+    def __init__(self, status_code: int, content: str, headers: Optional[Dict[str, str]] = None):
+        """Initialize the response adapter.
+        
+        Args:
+            status_code: HTTP status code
+            content: Response body as string
+            headers: Response headers
+        """
+        self.status_code = status_code
+        self.content = content.encode('utf-8') if content else b''
+        self.text = content
+        self.headers = headers or {}
+    
+    @classmethod
+    def from_aiohttp_response(cls, response: aiohttp.ClientResponse, content: str) -> 'ResponseAdapter':
+        """Create adapter from an aiohttp response.
+        
+        Args:
+            response: aiohttp ClientResponse
+            content: Response body (already read)
+            
+        Returns:
+            ResponseAdapter instance
+        """
+        return cls(
+            status_code=response.status,
+            content=content,
+            headers=dict(response.headers)
+        )
+
+
+class TransientHTTPError(Exception):
+    """Raised for HTTP 5xx errors that may be retried."""
+    
+    def __init__(self, status_code: int, content: str):
+        self.status_code = status_code
+        self.content = content
+        super().__init__(f"Transient HTTP error: {status_code}")
 
 
 class AsyncSessionManager:
@@ -126,7 +176,17 @@ class AsyncSessionManager:
         params: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Make an HTTP request with retry logic.
+        """Make an HTTP request with retry logic for transient errors.
+        
+        Retries on:
+        - Connection errors (ClientConnectorError, ServerDisconnectedError)
+        - Timeout errors
+        - 5xx server errors
+        
+        Does NOT retry on:
+        - 4xx client errors (returned/raised immediately)
+        - SSL errors
+        - Invalid URL errors
         
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -144,6 +204,21 @@ class AsyncSessionManager:
         """
         session = await self.get_session()
         last_exception = None
+        
+        # Non-retryable exceptions - fail immediately
+        NON_RETRYABLE = (
+            aiohttp.InvalidURL,
+            aiohttp.ClientSSLError,
+            aiohttp.ClientProxyConnectionError,
+        )
+        
+        # Retryable connection exceptions
+        RETRYABLE_CONNECTION = (
+            aiohttp.ClientConnectorError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+        )
         
         for attempt in range(self.retry_attempts):
             try:
@@ -168,20 +243,42 @@ class AsyncSessionManager:
                     params=params
                 ) as response:
                     content = await response.text()
-                    return self._handle_response(response.status, content, response)
+                    try:
+                        return self._handle_response(response.status, content, response)
+                    except TransientHTTPError as e:
+                        # 5xx errors are retryable
+                        last_exception = e
+                        if attempt < self.retry_attempts - 1:
+                            delay = self.retry_delay * (2 ** attempt)
+                            logger.warning(
+                                f"Transient HTTP {e.status_code} error, retrying in {delay}s "
+                                f"(attempt {attempt + 1}/{self.retry_attempts})"
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise SplitwiseException(
+                            f"Server error after {self.retry_attempts} attempts: {e.status_code}"
+                        )
+            
+            except NON_RETRYABLE as e:
+                # Non-retryable errors - fail immediately
+                raise SplitwiseException(f"Non-retryable error: {e}")
                     
+            except RETRYABLE_CONNECTION as e:
+                # Retryable connection errors
+                last_exception = e
+                if attempt < self.retry_attempts - 1:
+                    delay = self.retry_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Connection error: {e}, retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{self.retry_attempts})"
+                    )
+                    await asyncio.sleep(delay)
+                continue
+            
             except aiohttp.ClientError as e:
-                last_exception = e
-                if attempt < self.retry_attempts - 1:
-                    delay = self.retry_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-                continue
-            except asyncio.TimeoutError as e:
-                last_exception = e
-                if attempt < self.retry_attempts - 1:
-                    delay = self.retry_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-                continue
+                # Other client errors - don't retry
+                raise SplitwiseException(f"Client error: {e}")
         
         raise SplitwiseException(f"Request failed after {self.retry_attempts} attempts: {last_exception}")
     
@@ -191,42 +288,50 @@ class AsyncSessionManager:
         Args:
             status_code: HTTP status code
             content: Response content
-            response: Full response object
+            response: Full aiohttp response object
             
         Returns:
             Response content on success
             
         Raises:
-            SplitwiseException: On error status codes
+            TransientHTTPError: On 5xx errors (retryable)
+            SplitwiseException: On other error status codes
         """
         if status_code == 200:
             return content
         
+        # Create adapter for requests-compatible response
+        adapted_response = ResponseAdapter.from_aiohttp_response(response, content)
+        
+        # 5xx errors are transient and retryable
+        if 500 <= status_code < 600:
+            raise TransientHTTPError(status_code, content)
+        
         if status_code == 401:
             raise SplitwiseUnauthorizedException(
                 "Please check your token or consumer id and secret",
-                response=response
+                response=adapted_response
             )
         
         if status_code == 403:
             raise SplitwiseNotAllowedException(
                 "You are not allowed to perform this operation",
-                response=response
+                response=adapted_response
             )
         
         if status_code == 400:
             raise SplitwiseBadRequestException(
                 "Please check your request",
-                response=response
+                response=adapted_response
             )
         
         if status_code == 404:
             raise SplitwiseNotFoundException(
                 "Required resource is not found",
-                response=response
+                response=adapted_response
             )
         
-        raise SplitwiseException(f"Unknown error: {status_code}", response=response)
+        raise SplitwiseException(f"Unknown error: {status_code}", response=adapted_response)
     
     async def __aenter__(self) -> 'AsyncSessionManager':
         """Async context manager entry."""

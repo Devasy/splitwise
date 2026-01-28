@@ -3,6 +3,9 @@
 Provides backward-compatible synchronous API using asyncio.run().
 Use AsyncSplitwise directly for better performance in async applications.
 
+Note: This wrapper must NOT be called from within an async context.
+If you're already in an async function, use AsyncSplitwise directly.
+
 Typical usage:
     >>> from splitwise.sync_wrapper import SyncSplitwise
     >>> sw = SyncSplitwise("key", "secret", api_key="...")
@@ -12,7 +15,6 @@ Typical usage:
 
 import asyncio
 from typing import Optional, Dict, List, Tuple
-from functools import wraps
 
 from splitwise.async_client import AsyncSplitwise
 from splitwise.user import User, Friend, CurrentUser
@@ -26,20 +28,30 @@ from splitwise.error import SplitwiseError
 
 
 def _run_sync(coro):
-    """Run a coroutine synchronously."""
+    """Run a coroutine synchronously.
+    
+    Args:
+        coro: Coroutine to run
+        
+    Returns:
+        Result of the coroutine
+        
+    Raises:
+        RuntimeError: If called from within an async context
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
     
     if loop and loop.is_running():
-        # If we're already in an async context, create a new thread
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, coro)
-            return future.result()
-    else:
-        return asyncio.run(coro)
+        raise RuntimeError(
+            "SyncSplitwise cannot be used from within an async context. "
+            "Use AsyncSplitwise directly instead. "
+            "Example: await async_client.getCurrentUser()"
+        )
+    
+    return asyncio.run(coro)
 
 
 class SyncSplitwise:

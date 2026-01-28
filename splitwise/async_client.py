@@ -20,8 +20,17 @@ Typical usage:
 
 import json
 import asyncio
+import logging
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlencode
+
+try:
+    import aiofiles
+    AIOFILES_AVAILABLE = True
+except ImportError:
+    AIOFILES_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 from splitwise.user import User, Friend, CurrentUser
 from splitwise.currency import Currency
@@ -107,10 +116,25 @@ class AsyncSplitwise:
     def setAccessToken(self, access_token: Dict[str, str]) -> None:
         """Set OAuth 1.0 access token.
         
+        Note: OAuth 1.0 request signing is NOT fully supported in the async client.
+        The async client only supports OAuth 2.0 (via setOAuth2AccessToken) and
+        API key authentication. OAuth 1.0 tokens are stored but the signature
+        generation may not work correctly for all endpoints.
+        
+        For full OAuth 1.0 support, use the synchronous Splitwise client.
+        
         Args:
             access_token: Dict with oauth_token and oauth_token_secret
+            
+        Raises:
+            NotImplementedError: OAuth 1.0 is not fully supported
         """
-        self._access_token = access_token
+        raise NotImplementedError(
+            "OAuth 1.0 request signing is not supported in AsyncSplitwise. "
+            "Use setOAuth2AccessToken() for OAuth 2.0 authentication, "
+            "or pass api_key to the constructor for API key authentication. "
+            "For OAuth 1.0 support, use the synchronous Splitwise client."
+        )
     
     def setOAuth2AccessToken(self, access_token: Dict[str, str]) -> None:
         """Set OAuth 2.0 access token.
@@ -128,10 +152,16 @@ class AsyncSplitwise:
     ) -> Dict[str, str]:
         """Get authentication headers.
         
+        Supports:
+        - OAuth 2.0 Bearer tokens (recommended)
+        - API key authentication
+        
+        Note: OAuth 1.0 is NOT supported in the async client.
+        
         Args:
-            method: HTTP method (needed for OAuth 1.0 signature)
-            url: Request URL (needed for OAuth 1.0 signature)
-            data: Request data (needed for OAuth 1.0 signature)
+            method: HTTP method (unused, kept for API compatibility)
+            url: Request URL (unused, kept for API compatibility)
+            data: Request data (unused, kept for API compatibility)
         
         Returns:
             Headers dict with authorization
@@ -141,17 +171,9 @@ class AsyncSplitwise:
         if self._oauth2_access_token:
             token = self._oauth2_access_token.get('access_token', '')
             headers['Authorization'] = f'Bearer {token}'
-        elif self._access_token:
-            # OAuth 1.0 authentication
-            oauth = AsyncOAuth1(
-                self.consumer_key,
-                self.consumer_secret,
-                resource_owner_key=self._access_token.get('oauth_token'),
-                resource_owner_secret=self._access_token.get('oauth_token_secret')
-            )
-            headers['Authorization'] = oauth.get_auth_header(method, url, data)
         elif self.api_key:
             headers['Authorization'] = f'Bearer {self.api_key}'
+        # Note: OAuth 1.0 (_access_token) is not supported - setAccessToken raises NotImplementedError
         
         return headers
     
@@ -404,7 +426,8 @@ class AsyncSplitwise:
         Returns:
             Tuple of (created group, errors)
         """
-        group_info = group.__dict__
+        # Create a copy to avoid mutating the original group object
+        group_info = dict(group.__dict__)
         
         if "members" in group_info:
             group_members = group.getMembers()
@@ -434,7 +457,8 @@ class AsyncSplitwise:
         Returns:
             Tuple of (success, added user, errors)
         """
-        request_data = user.__dict__
+        # Create a copy to avoid mutating the original user object
+        request_data = dict(user.__dict__)
         request_data["group_id"] = group_id
         
         if "id" in request_data:
@@ -583,18 +607,24 @@ class AsyncSplitwise:
             expense_data["category_id"] = category.getId()
             del expense_data["category"]
         
-        # Handle receipt
+        # Handle receipt (use non-blocking I/O)
         files = None
+        receipt_data = None
         receipt = expense.getReceiptPath()
         if receipt:
-            files = {"receipt": open(receipt, "rb")}
+            if AIOFILES_AVAILABLE:
+                async with aiofiles.open(receipt, "rb") as f:
+                    receipt_data = await f.read()
+            else:
+                # Fallback to thread pool for blocking I/O
+                loop = asyncio.get_running_loop()
+                receipt_data = await loop.run_in_executor(
+                    None, lambda: open(receipt, "rb").read()
+                )
+            files = {"receipt": receipt_data}
             del expense_data["receiptPath"]
         
-        try:
-            content = await self._make_request(base.CREATE_EXPENSE_URL, "POST", expense_data, files=files)
-        finally:
-            if files:
-                files["receipt"].close()
+        content = await self._make_request(base.CREATE_EXPENSE_URL, "POST", expense_data, files=files)
         
         data = json.loads(content)
         created_expense = None
@@ -644,20 +674,25 @@ class AsyncSplitwise:
         for field in readonly_fields:
             expense_data.pop(field, None)
         
-        # Handle receipt
+        # Handle receipt (use non-blocking I/O)
         files = None
         receipt = expense.getReceiptPath()
         if receipt:
-            files = {"receipt": open(receipt, "rb")}
+            if AIOFILES_AVAILABLE:
+                async with aiofiles.open(receipt, "rb") as f:
+                    receipt_data = await f.read()
+            else:
+                # Fallback to thread pool for blocking I/O
+                loop = asyncio.get_running_loop()
+                receipt_data = await loop.run_in_executor(
+                    None, lambda: open(receipt, "rb").read()
+                )
+            files = {"receipt": receipt_data}
             del expense_data["receiptPath"]
         
-        try:
-            content = await self._make_request(
-                f"{base.UPDATE_EXPENSE_URL}/{expense_id}", "POST", expense_data, files=files
-            )
-        finally:
-            if files:
-                files["receipt"].close()
+        content = await self._make_request(
+            f"{base.UPDATE_EXPENSE_URL}/{expense_id}", "POST", expense_data, files=files
+        )
         
         data = json.loads(content)
         updated_expense = None
@@ -805,8 +840,19 @@ class AsyncSplitwise:
         Returns:
             List of Notification objects
         """
+        # Build query parameters
+        params = {}
+        if updated_since is not None:
+            params["updated_since"] = updated_since
+        if limit is not None:
+            params["limit"] = limit
+        
+        url = base.GET_NOTIFICATIONS_URL
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        
         try:
-            content = await self._make_request(base.GET_NOTIFICATIONS_URL)
+            content = await self._make_request(url)
         except SplitwiseNotAllowedException as e:
             e.setMessage("You are not allowed to fetch notifications")
             raise
@@ -821,7 +867,10 @@ class AsyncSplitwise:
     
     # ========== Batch/Concurrent Operations ==========
     
-    async def getAllGroupsWithExpenses(self, limit_per_group: int = 50) -> Dict[int, List[Expense]]:
+    async def getAllGroupsWithExpenses(
+        self, 
+        limit_per_group: int = 50
+    ) -> Tuple[Dict[int, List[Expense]], Dict[int, Exception]]:
         """Fetch all groups and their expenses concurrently.
         
         Optimized for edge devices - fetches all data in parallel.
@@ -830,7 +879,7 @@ class AsyncSplitwise:
             limit_per_group: Max expenses per group
             
         Returns:
-            Dict mapping group_id to list of expenses
+            Tuple of (dict mapping group_id to expenses, dict of group_id to errors)
         """
         groups = await self.getGroups()
         
@@ -843,12 +892,20 @@ class AsyncSplitwise:
         ], return_exceptions=True)
         
         group_expenses = {}
-        for result in results:
-            if isinstance(result, tuple):
-                group_id, expenses = result
+        errors = {}
+        for group, result in zip(groups, results):
+            group_id = group.getId()
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Failed to fetch expenses for group %d (%s): %s",
+                    group_id, group.getName(), result
+                )
+                errors[group_id] = result
+            elif isinstance(result, tuple):
+                _, expenses = result
                 group_expenses[group_id] = expenses
         
-        return group_expenses
+        return group_expenses, errors
     
     async def getAllExpensesPaginated(
         self,
