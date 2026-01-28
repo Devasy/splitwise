@@ -54,6 +54,7 @@ try:
     from splitwise.async_client import AsyncSplitwise
     from splitwise.sync_wrapper import SyncSplitwise
     from splitwise.session import AsyncSessionManager
+    from splitwise.oauth import AsyncOAuth1, AsyncOAuth2, AsyncOAuthClient
     ASYNC_AVAILABLE = True
 except ImportError:
     ASYNC_AVAILABLE = False

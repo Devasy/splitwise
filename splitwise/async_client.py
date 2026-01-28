@@ -39,6 +39,7 @@ from splitwise.exception import (
     SplitwiseNotFoundException
 )
 from splitwise.session import AsyncSessionManager
+from splitwise.oauth import AsyncOAuth1, AsyncOAuth2, AsyncOAuthClient
 from splitwise import base
 
 
@@ -119,8 +120,18 @@ class AsyncSplitwise:
         """
         self._oauth2_access_token = access_token
     
-    def _get_auth_headers(self) -> Dict[str, str]:
+    def _get_auth_headers(
+        self,
+        method: str = "GET",
+        url: str = "",
+        data: Optional[Dict] = None
+    ) -> Dict[str, str]:
         """Get authentication headers.
+        
+        Args:
+            method: HTTP method (needed for OAuth 1.0 signature)
+            url: Request URL (needed for OAuth 1.0 signature)
+            data: Request data (needed for OAuth 1.0 signature)
         
         Returns:
             Headers dict with authorization
@@ -130,6 +141,15 @@ class AsyncSplitwise:
         if self._oauth2_access_token:
             token = self._oauth2_access_token.get('access_token', '')
             headers['Authorization'] = f'Bearer {token}'
+        elif self._access_token:
+            # OAuth 1.0 authentication
+            oauth = AsyncOAuth1(
+                self.consumer_key,
+                self.consumer_secret,
+                resource_owner_key=self._access_token.get('oauth_token'),
+                resource_owner_secret=self._access_token.get('oauth_token_secret')
+            )
+            headers['Authorization'] = oauth.get_auth_header(method, url, data)
         elif self.api_key:
             headers['Authorization'] = f'Bearer {self.api_key}'
         
@@ -180,16 +200,76 @@ class AsyncSplitwise:
         Returns:
             Response content
         """
-        headers = self._get_auth_headers()
-        data = self._handle_uppercase_boolean(data)
+        processed_data = self._handle_uppercase_boolean(data.copy() if data else None)
+        headers = self._get_auth_headers(method, url, processed_data)
         
         return await self._session_manager.request(
             method=method,
             url=url,
             headers=headers,
-            data=data,
+            data=processed_data,
             files=files
         )
+    
+    # ========== OAuth Methods ==========
+    
+    async def getRequestToken(self) -> Tuple[str, str]:
+        """Get OAuth 1.0 request token.
+        
+        Returns:
+            Tuple of (authorize_url, oauth_token_secret)
+        """
+        client = AsyncOAuthClient(self.consumer_key, self.consumer_secret)
+        oauth_token, oauth_token_secret = await client.get_request_token()
+        authorize_url = client.get_authorize_url(oauth_token)
+        return authorize_url, oauth_token_secret
+    
+    async def getAccessToken(
+        self,
+        oauth_token: str,
+        oauth_token_secret: str,
+        oauth_verifier: str
+    ) -> Dict[str, str]:
+        """Exchange request token for access token.
+        
+        Args:
+            oauth_token: OAuth token from redirect URL
+            oauth_token_secret: Token secret from getRequestToken
+            oauth_verifier: Verifier from redirect URL
+            
+        Returns:
+            Dict with oauth_token and oauth_token_secret
+        """
+        client = AsyncOAuthClient(self.consumer_key, self.consumer_secret)
+        return await client.get_access_token(
+            oauth_token, oauth_token_secret, oauth_verifier
+        )
+    
+    def getOAuth2AuthorizeURL(self, redirect_uri: str, state: Optional[str] = None) -> str:
+        """Get OAuth 2.0 authorization URL.
+        
+        Args:
+            redirect_uri: Redirect URI for callback
+            state: Optional state for CSRF protection
+            
+        Returns:
+            Authorization URL
+        """
+        client = AsyncOAuthClient(self.consumer_key, self.consumer_secret)
+        return client.get_oauth2_authorize_url(redirect_uri, state)
+    
+    async def getOAuth2AccessToken(self, code: str, redirect_uri: str) -> Optional[Dict[str, Any]]:
+        """Exchange OAuth 2.0 code for access token.
+        
+        Args:
+            code: Authorization code from redirect
+            redirect_uri: Redirect URI used for authorization
+            
+        Returns:
+            Dict with access_token and token_type
+        """
+        client = AsyncOAuthClient(self.consumer_key, self.consumer_secret)
+        return await client.get_oauth2_access_token(code, redirect_uri)
     
     # ========== User Methods ==========
     
