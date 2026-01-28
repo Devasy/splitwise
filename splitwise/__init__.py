@@ -2,7 +2,7 @@
 
 Splitwise Python SDK provides a simple interface to access splitwise APIs
 
-    Typical usage:
+    Typical usage (Synchronous - Original):
 
     >>> s = Splitwise("consumer_key", "consumer_secret")
     >>> s.setAccessToken(access_token)
@@ -15,6 +15,17 @@ Splitwise Python SDK provides a simple interface to access splitwise APIs
     >>> created_expense, errors = s.createExpense(expense)
     >>> created_expense.getId()
     897763
+
+    Async usage (Recommended for high-throughput):
+
+    >>> from splitwise import AsyncSplitwise
+    >>> async with AsyncSplitwise("key", "secret", api_key="...") as sw:
+    ...     user = await sw.getCurrentUser()
+    ...     # Concurrent fetching for 10x+ speedup
+    ...     groups, expenses = await asyncio.gather(
+    ...         sw.getGroups(),
+    ...         sw.getExpenses(limit=100)
+    ...     )
 
 """
 import json
@@ -37,6 +48,15 @@ from splitwise.exception import (SplitwiseException,
                                  )
 
 from .__version__ import __version__  # noqa: F401
+
+# Async client imports (optional - requires aiohttp)
+try:
+    from splitwise.async_client import AsyncSplitwise
+    from splitwise.sync_wrapper import SyncSplitwise
+    from splitwise.session import AsyncSessionManager
+    ASYNC_AVAILABLE = True
+except ImportError:
+    ASYNC_AVAILABLE = False
 
 try:
     from urlparse import parse_qs  # Python 2.x
